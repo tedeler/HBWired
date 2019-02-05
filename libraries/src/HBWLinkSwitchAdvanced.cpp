@@ -12,16 +12,14 @@
 
 #define EEPROM_SIZE 20  // "address_step"
 
-#define NUM_PEER_PARAMS 8   // number of bytes for long or short peering action
+#define NUM_PEER_PARAMS 7   // number of bytes for long and short peering action each (without address and channel)
 
 HBWLinkSwitchAdvanced::HBWLinkSwitchAdvanced(uint8_t _numLinks, uint16_t _eepromStart) {
 	numLinks = _numLinks;
 	eepromStart = _eepromStart;
 }
  
-// processKeyEvent wird aufgerufen, wenn ein Tastendruck empfangen wurde
-// TODO: von wem aufgerufen? Direkt von der Tasten-Implementierung oder vom Device? 
-//       wahrscheinlich besser vom Device ueber sendKeyEvent
+// receiveKeyEvent wird aufgerufen, wenn ein Tastendruck empfangen wurde
 // TODO: Der Beginn aller Verknuepfungen ist gleich. Eigentlich koennte man 
 //       das meiste in einer gemeinsamen Basisklasse abhandeln
 void HBWLinkSwitchAdvanced::receiveKeyEvent(HBWDevice* device, uint32_t senderAddress, uint8_t senderChannel, 
@@ -31,8 +29,8 @@ void HBWLinkSwitchAdvanced::receiveKeyEvent(HBWDevice* device, uint32_t senderAd
   uint8_t channelEEPROM;
   uint8_t actionType;
 
-  uint8_t data[NUM_PEER_PARAMS];  // store all peer parameter
-  data[7] = keyPressNum;
+  uint8_t data[NUM_PEER_PARAMS +1];  // store all peer parameter (use extra element for keyPressNum)
+  data[NUM_PEER_PARAMS] = keyPressNum;
   
   // read what to do from EEPROM
   for(byte i = 0; i < numLinks; i++) {   
@@ -51,24 +49,24 @@ void HBWLinkSwitchAdvanced::receiveKeyEvent(HBWDevice* device, uint32_t senderAd
     if (!longPress) { // differs for short and long
       device->readEEPROM(&actionType, eepromStart + EEPROM_SIZE * i + 6, 1);      // read shortPress actionType
       if (actionType & B00001111) {   // SHORT_ACTION_TYPE, ACTIVE
-        // read other values and call channel peeringEventTrigger()
-        device->readEEPROM(&data, eepromStart + EEPROM_SIZE * i + 6, NUM_PEER_PARAMS -1);     // read all parameters (must be consecutive)
+        // when active, read all other values and call channel set()
+        device->readEEPROM(&data, eepromStart + EEPROM_SIZE * i + 6, NUM_PEER_PARAMS);     // read all parameters (must be consecutive)
       //           + 6        //  SHORT_ACTION_TYPE
       //           + 7        //  SHORT_ONDELAY_TIME
       //           + 8        //  SHORT_ON_TIME
       //           + 9        //  SHORT_OFFDELAY_TIME
       //           + 10       //  SHORT_OFF_TIME
       //           + 11, 12   //  SHORT_JT_* table
-        device->set(targetChannel,NUM_PEER_PARAMS,data);    // channel, data length, data
+        device->set(targetChannel,NUM_PEER_PARAMS +1,data);    // channel, data length, data
       }
     }
     // read specific long action eeprom section
     else {
-      device->readEEPROM(&actionType, eepromStart + EEPROM_SIZE * i + 13, 1); // read longPress actionType
+      device->readEEPROM(&actionType, eepromStart + EEPROM_SIZE * i + 6 + NUM_PEER_PARAMS, 1); // read longPress actionType
       if (actionType & B00001111) {  // LONG_ACTION_TYPE, ACTIVE
-        // read other values and call channel peeringEventTrigger()
-        device->readEEPROM(&data, eepromStart + EEPROM_SIZE * i + 13, NUM_PEER_PARAMS -1);     // read all parameters (must be consecutive)
-        device->set(targetChannel,NUM_PEER_PARAMS,data);    // channel, data length, data
+        // when active, read all other values and call channel set()
+        device->readEEPROM(&data, eepromStart + EEPROM_SIZE * i + 6 + NUM_PEER_PARAMS, NUM_PEER_PARAMS);     // read all parameters (must be consecutive)
+        device->set(targetChannel, NUM_PEER_PARAMS +1, data);    // channel, data length, data
       }
     }
   }

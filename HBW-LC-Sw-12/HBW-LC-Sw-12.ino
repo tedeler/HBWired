@@ -27,22 +27,24 @@
 #define HMW_DEVICETYPE 0x93
 #define HARDWARE_VERSION 0x01
 #define FIRMWARE_VERSION 0x0004
+
 #define USE_HARDWARE_SERIAL   // use hardware serial (USART), this disables debug output
 
 #define NUM_SW_CHANNELS 12  // switch/relay
 #define NUM_AD_CHANNELS 6   // analog input
-#define NUM_CHANNELS 18     // total amount
+#define NUM_CHANNELS NUM_SW_CHANNELS + NUM_AD_CHANNELS     // total amount
 #define NUM_LINKS 36
 #define LINKADDRESSSTART 0x40
 
-#include "FreeRam.h"
 
+#include <FreeRam.h>
 
 // HB Wired protocol and module
-#include "HBWired.h"
-#include "HBWLinkSwitchAdvanced.h"
-//#include "HBWSwitchSerialAdvanced.h"
-#include "HBWAnalogIn.h"
+#include <HBWired.h>
+#include <HBWLinkSwitchAdvanced.h>
+//#include "HBWSwitchSerialAdvanced.h"  //TODO : move to seperate files
+#include <HBWAnalogIn.h>
+#include <HBWlibStateMachine.h>
 
 // shift register library
 #include "ShiftRegister74HC595.h"
@@ -50,6 +52,7 @@
 
 // Pins
 #ifdef USE_HARDWARE_SERIAL
+  #define BUTTON A6  // Button fuer Factory-Reset etc.
   #define RS485_TXEN 2  // Transmit-Enable
   #define shiftReg_OutputEnable 8   // OE output enable, connect to all shift register
   // 6 realys and LED attached to 3 shiftregisters
@@ -62,6 +65,7 @@
   #define shiftRegTwo_Latch 9
   
 #else
+  #define BUTTON 8  // Button fuer Factory-Reset etc.
   #define RS485_RXD 4
   #define RS485_TXD 2
   #define RS485_TXEN 3  // Transmit-Enable
@@ -75,15 +79,9 @@
   #define shiftRegTwo_Clock 7
   #define shiftRegTwo_Latch 6
   
-  #include "HBWSoftwareSerial.h"
+  #include <HBWSoftwareSerial.h>
   // HBWSoftwareSerial can only do 19200 baud
   HBWSoftwareSerial rs485(RS485_RXD, RS485_TXD); // RX, TX
-#endif
-
-#ifdef USE_HARDWARE_SERIAL
-  #define BUTTON A6  // Button fuer Factory-Reset etc.
-#else
-  #define BUTTON 8  // Button fuer Factory-Reset etc.
 #endif
 
 #define LED LED_BUILTIN        // Signal-LED
@@ -105,12 +103,6 @@
 #define JT_OFFDELAY 0x02
 #define JT_OFF 0x03
 #define JT_NO_JUMP_IGNORE_COMMAND 0x04
-#define ON_TIME_ABSOLUTE 0x0A
-#define OFF_TIME_ABSOLUTE 0x0B
-#define ON_TIME_MINIMAL 0x0C
-#define OFF_TIME_MINIMAL 0x0D
-#define UNKNOWN_STATE 0xFF
-#define FORCE_STATE_CHANGE 0xFE
 
 
 struct hbw_config_switch {
@@ -126,8 +118,8 @@ struct hbw_config {
   uint32_t central_address;  // 0x02 - 0x05
   uint8_t direct_link_deactivate:1;   // 0x06:0
   uint8_t              :7;   // 0x06:1-7
-  hbw_config_switch switchcfg[NUM_SW_CHANNELS]; // 0x07-0x1F (2 bytes each)
-  hbw_config_analog_in ctcfg[NUM_AD_CHANNELS];    // 0x20-0x2C (2 bytes each)
+  hbw_config_switch switchCfg[NUM_SW_CHANNELS]; // 0x07-0x1F (2 bytes each)
+  hbw_config_analog_in ctCfg[NUM_AD_CHANNELS];    // 0x20-0x2C (2 bytes each)
 } hbwconfig;
 
 
@@ -148,26 +140,12 @@ class HBWChanSw : public HBWChannel {
     uint16_t nextFeedbackDelay; // 0 -> no feedback pending
     
     bool operateRelay;
-    unsigned long relayOperationTimeStart;
+    uint32_t relayOperationTimeStart;
     
     // set from links/peering (implements state machine)
     void setOutput(uint8_t const * const data);
-    uint8_t getNextState(uint8_t bitshift);
-    inline uint32_t convertTime(uint8_t timeValue);
-    uint8_t actiontype;
-    uint8_t onDelayTime;
-    uint8_t onTime;
-    uint8_t offDelayTime;
-    uint8_t offTime;
-    union { uint16_t WORD;
-      uint8_t jt_hi_low[2];
-    } jumpTargets;
-    boolean stateTimerRunning;
-    uint8_t currentState;
-    uint8_t nextState;
-    unsigned long stateCangeWaitTime;
-    unsigned long lastStateChangeTime;
-    uint8_t lastKeyEvent;
+    HBWlibStateMachine StateMachine;
+    
 };
 
 
@@ -190,7 +168,7 @@ class HBSwDevice : public HBWDevice {
 
 // device specific defaults
 void HBSwDevice::afterReadConfig() {
-  if(hbwconfig.logging_time == 0xFF) hbwconfig.logging_time = 20;
+  if(hbwconfig.logging_time == 0xFF) hbwconfig.logging_time = 50;
 };
 
 
@@ -211,13 +189,13 @@ HBWChanSw::HBWChanSw(uint8_t _relayPos, uint8_t _ledPos, ShiftRegister74HC595* _
   relayOperationTimeStart = 0;
   operateRelay = false;
   
-  onTime = 0xFF;
-  offTime = 0xFF;
-  jumpTargets.WORD = 0;
-  stateTimerRunning = false;
-  stateCangeWaitTime = 0;
-  lastStateChangeTime = 0;
-//  currentState = UNKNOWN_STATE;
+  StateMachine.onTime = 0xFF;
+  StateMachine.offTime = 0xFF;
+  StateMachine.jumpTargets.DWORD = 0;
+  StateMachine.stateTimerRunning = false;
+  StateMachine.stateChangeWaitTime = 0;
+  StateMachine.lastStateChangeTime = 0;
+//  StateMachine.setCurrentState(UNKNOWN_STATE);
 };
 
 // channel specific settings or defaults
@@ -228,11 +206,11 @@ void HBWChanSw::afterReadConfig() {
   //need intial reset (or set if inverterted) for all relays - bistable relays may have incorrect state!!!
   if (level) {   // set to 0 or 1
     level = (LOW ^ config->n_inverted);
-    currentState = JT_ON;   // update for state machine
+    StateMachine.setCurrentState(JT_ON);
   }
   else {
     level = (HIGH ^ config->n_inverted);
-    currentState = JT_OFF;   // update for state machine
+    StateMachine.setCurrentState(JT_OFF);
   }
 // TODO: add zero crossing function?
 
@@ -245,9 +223,9 @@ void HBWChanSw::afterReadConfig() {
     shiftRegister->set(relayPos +1, HIGH);  // reset coil
   }
 
-  nextState = currentState; // no action for state machine needed
+  StateMachine.avoidStateChange(); // no action for state machine needed
 
-  relayOperationTimeStart = millis();  // Relay coils must be set two low after some ms (bistable Relays!!)
+  relayOperationTimeStart = millis();  // Relay coils must be set two low after some ms (bistable relays!)
   operateRelay = true;
 }
 
@@ -255,27 +233,27 @@ void HBWChanSw::afterReadConfig() {
 void HBWChanSw::set(HBWDevice* device, uint8_t length, uint8_t const * const data) {
 
   if (length >= 8) {  // got called with additional peering parameters -- test for correct NUM_PEER_PARAMS
-    actiontype = *(data);
-    uint8_t keyEvent = data[7];
+    StateMachine.writePeerParamActionType(*(data));
+    uint8_t currentKeyNum = data[7];
 
 #ifndef USE_HARDWARE_SERIAL
   hbwdebug(F("aV: "));
-  hbwdebughex(keyEvent);
+  hbwdebughex(currentKeyNum);
   hbwdebug(F("\n"));
 #endif
 
-    if ((actiontype & B00001111) >1) {   // TOGGLE_USE
-      if (!stateTimerRunning && lastKeyEvent != keyEvent) {   // do not interrupt running timer, ignore LONG_MULTIEXECUTE
+    if (StateMachine.peerParam_getActionType() >1) {   // ACTION_TYPE
+      if (!StateMachine.stateTimerRunning && StateMachine.lastKeyNum != currentKeyNum) {   // do not interrupt running timer, ignore LONG_MULTIEXECUTE
         byte level;
-        if ((actiontype & B00001111) == 2)   // TOGGLE_TO_COUNTER
-          level = ((keyEvent %2 == 0) ? 0 : 200);  //  (switch ON at odd numbers, OFF at even numbers)
-        else if ((actiontype & B00001111) == 3)   // TOGGLE_INVERSE_TO_COUNTER
-          level = ((keyEvent %2 == 0) ? 200 : 0);
+        if (StateMachine.peerParam_getActionType() == 2)   // TOGGLE_TO_COUNTER
+          level = ((currentKeyNum %2 == 0) ? 0 : 200);  //  (switch ON at odd numbers, OFF at even numbers)
+        else if (StateMachine.peerParam_getActionType() == 3)   // TOGGLE_INVERSE_TO_COUNTER
+          level = ((currentKeyNum %2 == 0) ? 200 : 0);
         else   // TOGGLE
           level = 255;
         
         setOutput(&level);
-        nextState = currentState; // avoid state machine to run
+        StateMachine.avoidStateChange(); // avoid state machine to run
         
 #ifndef USE_HARDWARE_SERIAL
   hbwdebug(F("Tg to: "));
@@ -284,34 +262,35 @@ void HBWChanSw::set(HBWDevice* device, uint8_t length, uint8_t const * const dat
 #endif
       }
     }
-    else if (lastKeyEvent == keyEvent && !(bitRead(actiontype,5))) {
-      // repeated key event, must be long press: LONG_MULTIEXECUTE not enabled
+    else if (StateMachine.lastKeyNum == currentKeyNum && !StateMachine.peerParam_getLongMultiexecute()) {
+      // repeated key event for ACTION_TYPE == 1 (ACTION_TYPE == 0 already filtered by receiveKeyEvent, HBWLinkReceiver)
+      // must be long press, but LONG_MULTIEXECUTE not enabled
     }
     else {
       // assign values based on EEPROM layout
-      onDelayTime = data[1];
-      onTime = data[2];
-      offDelayTime = data[3];
-      offTime = data[4];
-      jumpTargets.jt_hi_low[0] = data[5];
-      jumpTargets.jt_hi_low[1] = data[6];
+      StateMachine.onDelayTime = data[1];
+      StateMachine.onTime = data[2];
+      StateMachine.offDelayTime = data[3];
+      StateMachine.offTime = data[4];
+      StateMachine.jumpTargets.jt_hi_low[0] = data[5];
+      StateMachine.jumpTargets.jt_hi_low[1] = data[6];
 
-      nextState = FORCE_STATE_CHANGE; // force update
+      StateMachine.forceStateChange(); // force update
 
 #ifndef USE_HARDWARE_SERIAL
   hbwdebug(F("onT: "));
-  hbwdebughex(onTime);
+  hbwdebughex(StateMachine.onTime);
   hbwdebug(F("\n"));
 #endif
 
     }
-    lastKeyEvent = keyEvent;  // store key press number, to identify repeated key events
+    StateMachine.lastKeyNum = currentKeyNum;  // store key press number, to identify repeated key events
   }
   else {  // set value - no peering event, overwrite any timer //TODO check: ok to ignore absolute on/off time running? how do original devices handle this?
     //if (!stateTimerRunning)??
     setOutput(data);
-    stateTimerRunning = false;
-    nextState = currentState; // avoid state machine to run
+    StateMachine.stateTimerRunning = false;
+    StateMachine.avoidStateChange(); // avoid state machine to run
   }
 };
 
@@ -326,12 +305,12 @@ void HBWChanSw::setOutput(uint8_t const * const data) {
     else if (level) {   // set to 0 or 1
       level = (LOW ^ config->n_inverted);
       shiftRegister->set(ledPos, HIGH); // set LEDs (register used for actual state!)
-      currentState = JT_ON;   // update for state machine
+      StateMachine.setCurrentState(JT_ON);   // update for state machine
     }
     else {
       level = (HIGH ^ config->n_inverted);
       shiftRegister->set(ledPos, LOW); // set LEDs (register used for actual state!)
-      currentState = JT_OFF;   // update for state machine
+      StateMachine.setCurrentState(JT_OFF);   // update for state machine
     }
 // TODO: add zero crossing function?. Just set portStatus[]? + add portStatusDesired[]?
 // call same function from afterReadConfig()...
@@ -373,7 +352,7 @@ void HBWChanSw::loop(HBWDevice* device, uint8_t channel) {
 
   /* important to remove power from latching relay after some milliseconds!! */
   if (((now - relayOperationTimeStart) >= RELAY_PULSE_DUARTION) && operateRelay == true) {
-  // time to remove power from both coils?
+  // time to remove power from all coils?
     shiftRegister->setNoUpdate(relayPos +1, LOW);    // reset coil
     shiftRegister->setNoUpdate(relayPos, LOW);       // set coil
     shiftRegister->updateRegisters();
@@ -381,120 +360,120 @@ void HBWChanSw::loop(HBWDevice* device, uint8_t channel) {
     operateRelay = false;
   }
   
-//*** state machine begin ***//
-  bool setNewLevel = false;
+ //*** state machine begin ***//
 
-  if (((now - lastStateChangeTime > stateCangeWaitTime) && stateTimerRunning) || currentState != nextState) {
+  if (((now - StateMachine.lastStateChangeTime > StateMachine.stateChangeWaitTime) && StateMachine.stateTimerRunning) || StateMachine.getCurrentState() != StateMachine.getNextState()) {
 
-    if (currentState == nextState)  // no change to state, so must be time triggered
-      stateTimerRunning = false;
+    if (StateMachine.getCurrentState() == StateMachine.getNextState())  // no change to state, so must be time triggered
+      StateMachine.stateTimerRunning = false;
 
 #ifndef USE_HARDWARE_SERIAL
   hbwdebug(F("chan:"));
   hbwdebughex(channel);
   hbwdebug(F(" cs:"));
-  hbwdebughex(currentState);
+  hbwdebughex(StateMachine.getCurrentState());
 #endif
     
     // check next jump from current state
-    switch (currentState) {
+    switch (StateMachine.getCurrentState()) {
       case JT_ONDELAY:      // jump from on delay state
-        nextState = getNextState(0);
+        StateMachine.setNextState(StateMachine.getJumpTarget(0, JT_ON, JT_OFF));
         break;
       case JT_ON:       // jump from on state
-        nextState = getNextState(3);
+        StateMachine.setNextState(StateMachine.getJumpTarget(3, JT_ON, JT_OFF));
         break;
       case JT_OFFDELAY:    // jump from off delay state
-        nextState = getNextState(6);
+        StateMachine.setNextState(StateMachine.getJumpTarget(6, JT_ON, JT_OFF));
         break;
       case JT_OFF:      // jump from off state
-        nextState = getNextState(9);
+        StateMachine.setNextState(StateMachine.getJumpTarget(9, JT_ON, JT_OFF));
         break;
     }
 
 #ifndef USE_HARDWARE_SERIAL
   hbwdebug(F(" ns:"));
-  hbwdebughex(nextState);
+  hbwdebughex(StateMachine.getNextState());
   hbwdebug(F("\n"));
 #endif
 
+    bool setNewLevel = false;
     uint8_t newLevel = 0;   // default value. Will only be set if setNewLevel was also set 'true'
     uint8_t currentLevel;
     get(&currentLevel);
  
-    if (nextState != JT_NO_JUMP_IGNORE_COMMAND) {
+    if (StateMachine.getNextState() < JT_NO_JUMP_IGNORE_COMMAND) {
       
-      switch (nextState) {
+      switch (StateMachine.getNextState()) {
         case JT_ONDELAY:
-          stateCangeWaitTime = convertTime(onDelayTime);
-          lastStateChangeTime = now;
-          stateTimerRunning = true;
-          currentState = JT_ONDELAY;
+          StateMachine.stateChangeWaitTime = StateMachine.convertTime(StateMachine.onDelayTime);
+          StateMachine.lastStateChangeTime = now;
+          StateMachine.stateTimerRunning = true;
+          StateMachine.setCurrentState(JT_ONDELAY);
           break;
           
         case JT_ON:
           newLevel = 200;
           setNewLevel = true;
-          stateTimerRunning = false;
+          StateMachine.stateTimerRunning = false;
           break;
           
         case JT_OFFDELAY:
-          stateCangeWaitTime = convertTime(offDelayTime);
-          lastStateChangeTime = now;
-          stateTimerRunning = true;
-          currentState = JT_OFFDELAY;
+          StateMachine.stateChangeWaitTime = StateMachine.convertTime(StateMachine.offDelayTime);
+          StateMachine.lastStateChangeTime = now;
+          StateMachine.stateTimerRunning = true;
+          StateMachine.setCurrentState(JT_OFFDELAY);
           break;
           
         case JT_OFF:
           //newLevel = 0; // 0 is default
           setNewLevel = true;
-          stateTimerRunning = false;
+          StateMachine.stateTimerRunning = false;
           break;
           
         case ON_TIME_ABSOLUTE:
           newLevel = 200;
           setNewLevel = true;
-          stateCangeWaitTime = convertTime(onTime);
-          lastStateChangeTime = now;
-          stateTimerRunning = true;
-          nextState = JT_ON;
+          StateMachine.stateChangeWaitTime = StateMachine.convertTime(StateMachine.onTime);
+          StateMachine.lastStateChangeTime = now;
+          StateMachine.stateTimerRunning = true;
+          StateMachine.setNextState(JT_ON);
           break;
           
         case OFF_TIME_ABSOLUTE:
           //newLevel = 0; // 0 is default
           setNewLevel = true;
-          stateCangeWaitTime = convertTime(offTime);
-          lastStateChangeTime = now;
-          stateTimerRunning = true;
-          nextState = JT_OFF;
+          StateMachine.stateChangeWaitTime = StateMachine.convertTime(StateMachine.offTime);
+          StateMachine.lastStateChangeTime = now;
+          StateMachine.stateTimerRunning = true;
+          StateMachine.setNextState(JT_OFF);
           break;
           
         case ON_TIME_MINIMAL:
           newLevel = 200;
           setNewLevel = true;
-          if (now - lastStateChangeTime < convertTime(onTime)) {
-            stateCangeWaitTime = convertTime(onTime);
-            lastStateChangeTime = now;
-            stateTimerRunning = true;
+          if (now - StateMachine.lastStateChangeTime < StateMachine.convertTime(StateMachine.onTime)) {
+            StateMachine.stateChangeWaitTime = StateMachine.convertTime(StateMachine.onTime);
+            StateMachine.lastStateChangeTime = now;
+            StateMachine.stateTimerRunning = true;
           }
-          nextState = JT_ON;
+          StateMachine.setNextState(JT_ON);
           break;
           
         case OFF_TIME_MINIMAL:
           //newLevel = 0; // 0 is default
           setNewLevel = true;
-          if (now - lastStateChangeTime < convertTime(offTime)) {
-            stateCangeWaitTime = convertTime(offTime);
-            lastStateChangeTime = now;
-            stateTimerRunning = true;
+          if (now - StateMachine.lastStateChangeTime < StateMachine.convertTime(StateMachine.offTime)) {
+            StateMachine.stateChangeWaitTime = StateMachine.convertTime(StateMachine.offTime);
+            StateMachine.lastStateChangeTime = now;
+            StateMachine.stateTimerRunning = true;
           }
-          nextState = JT_OFF;
+          StateMachine.setNextState(JT_OFF);
           break;
       }
     }
     else {  // NO_JUMP_IGNORE_COMMAND
-      currentState = (currentLevel ? JT_ON : JT_OFF );    // get current level and update state, TODO: actually needed? or keep for robustness?
-      nextState = currentState;   // avoid to run into a loop
+      StateMachine.setCurrentState(currentLevel ? JT_ON : JT_OFF );    // get current level and update state, TODO: actually needed? or keep for robustness?
+      StateMachine.avoidStateChange();   // avoid to run into a loop
     }
     if (currentLevel != newLevel && setNewLevel) {   // check for current level. don't set same level again
       setOutput(&newLevel);
@@ -523,54 +502,6 @@ void HBWChanSw::loop(HBWDevice* device, uint8_t channel) {
 };
 
 
-// read jump target entry - set by peering (used for state machine)
-uint8_t HBWChanSw::getNextState(uint8_t bitshift) {
-  
-  uint8_t nextJump = ((jumpTargets.WORD >>bitshift) & B00000111);
-  
-  if (nextJump == JT_ON) {
-    if (onTime != 0xFF)      // not used is 0xFF
-      nextJump = (actiontype & B10000000) ? ON_TIME_ABSOLUTE : ON_TIME_MINIMAL;  // on time ABSOLUTE or MINIMAL?
-  }
-  else if (nextJump == JT_OFF) {
-    if (offTime != 0xFF)      // not used is 0xFF
-      nextJump = (actiontype & B01000000) ? OFF_TIME_ABSOLUTE : OFF_TIME_MINIMAL;  // off time ABSOLUTE or MINIMAL?
-  }
-  
-  if (stateTimerRunning && nextState == FORCE_STATE_CHANGE) { // timer still running, but update forced
-    if (currentState == JT_ON)
-      nextJump = (actiontype & B10000000) ? ON_TIME_ABSOLUTE : ON_TIME_MINIMAL;
-    else if (currentState == JT_OFF)
-      nextJump = (actiontype & B01000000) ? OFF_TIME_ABSOLUTE : OFF_TIME_MINIMAL;
-  }
-  return nextJump;
-};
-
-
-// convert time value stored in EEPROM to milliseconds (used for state machine)
-uint32_t HBWChanSw::convertTime(uint8_t timeValue) {
-  uint8_t factor = timeValue & 0xC0;    // mask out factor (higest two bits)
-  timeValue &= 0x3F;    // keep time value only
-
-  // factors: 1,60,1000,6000 (last one is not used)
-  switch (factor) {
-    case 0:         // x1
-      return (uint32_t)timeValue *1000;
-      break;
-    case 64:         // x60
-      return (uint32_t)timeValue *60000;
-      break;
-    case 128:        // x1000
-      return (uint32_t)timeValue *1000000;
-      break;
-//    case 192:        // not used value
-//      return 0; // TODO: check how to handle this properly, what does on/off time == 0 mean? always on/off??
-//      break;
-  }
-  return 0;
-};
-
-
 
 void setup()
 {
@@ -583,11 +514,11 @@ void setup()
   // create channels
   for(uint8_t i = 0; i < NUM_SW_CHANNELS; i++) {
     if (i < 6) {
-      channels[i] = new HBWChanSw(RelayBitPos[i], LEDBitPos[i], &myShReg_one, &(hbwconfig.switchcfg[i]));
-      channels[i+NUM_SW_CHANNELS] = new HBWAnalogIn(currentTransformerPins[i], &(hbwconfig.ctcfg[i]));
+      channels[i] = new HBWChanSw(RelayBitPos[i], LEDBitPos[i], &myShReg_one, &(hbwconfig.switchCfg[i]));
+      channels[i+NUM_SW_CHANNELS] = new HBWAnalogIn(currentTransformerPins[i], &(hbwconfig.ctCfg[i]));
     }
     else
-      channels[i] = new HBWChanSw(RelayBitPos[i %6], LEDBitPos[i %6], &myShReg_two, &(hbwconfig.switchcfg[i]));
+      channels[i] = new HBWChanSw(RelayBitPos[i %6], LEDBitPos[i %6], &myShReg_two, &(hbwconfig.switchCfg[i]));
   };
 
 #ifdef USE_HARDWARE_SERIAL  // RS485 via UART Serial, no debug (_debugstream is NULL)
@@ -600,11 +531,6 @@ void setup()
                          NULL, new HBWLinkSwitchAdvanced(NUM_LINKS,LINKADDRESSSTART));
   
   device->setConfigPins(BUTTON, LED);  // use analog input for 'BUTTON'
-
-  
-  // set shift register OE low, this enables the output (only do this after latches have been initialized!)
-  digitalWrite(shiftReg_OutputEnable, LOW);
-  pinMode(shiftReg_OutputEnable, OUTPUT);
   
 #else
   Serial.begin(19200);
@@ -622,6 +548,10 @@ void setup()
   hbwdebug(freeRam());
   hbwdebug(F("\n"));
 #endif
+
+  // set shift register OE low, this enables the output (only do this after latches have been initialized!)
+  digitalWrite(shiftReg_OutputEnable, LOW);
+  pinMode(shiftReg_OutputEnable, OUTPUT);
 }
 
 
